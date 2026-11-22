@@ -493,6 +493,33 @@ def crop_digit(binary_image, padding=10):
     return cropped, info
 
 
+def _significant_enclosed_hole_count(binary_image, minimum_area_ratio=0.08):
+    """Count substantial enclosed regions, ignoring small pencil gaps."""
+    points = cv2.findNonZero(binary_image)
+    if points is None:
+        return 0
+
+    x, y, width, height = cv2.boundingRect(points)
+    digit = binary_image[y:y + height, x:x + width]
+    contours, hierarchy = cv2.findContours(
+        digit.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if hierarchy is None:
+        return 0
+
+    minimum_area = float(width * height) * minimum_area_ratio
+    holes = 0
+    for index, contour in enumerate(contours):
+        depth = 0
+        parent = int(hierarchy[0][index][3])
+        while parent != -1:
+            depth += 1
+            parent = int(hierarchy[0][parent][3])
+        if depth % 2 == 1 and cv2.contourArea(contour) >= minimum_area:
+            holes += 1
+    return holes
+
+
 def normalize_digit_image(cropped_binary):
     """
     Normalize a cropped binary digit image to a standardized 28x28 canvas.
@@ -607,18 +634,30 @@ def normalize_digit_image(cropped_binary):
     new_height = max(1, int(round(digit_h * scale)))
 
     # Resize the digit proportionally.
-    # INTER_NEAREST preserves binary values (0/255) without interpolation
-    # artifacts that could blur thin strokes during large downscale.
+    # Keep the existing nearest-neighbor result unless it loses a substantial
+    # enclosed region. Area interpolation can preserve narrow loops in large,
+    # naturally written digits that otherwise open during downscaling.
     resized = cv2.resize(
         digit_region,
         (new_width, new_height),
         interpolation=cv2.INTER_NEAREST,
     )
-
-    # Ensure the resized image is strictly binary (0 or 255).
     _, resized = cv2.threshold(
         resized, 127, 255, cv2.THRESH_BINARY
     )
+
+    source_holes = _significant_enclosed_hole_count(digit_region)
+    if source_holes > _significant_enclosed_hole_count(resized):
+        area_resized = cv2.resize(
+            digit_region,
+            (new_width, new_height),
+            interpolation=cv2.INTER_AREA,
+        )
+        _, area_resized = cv2.threshold(
+            area_resized, 80, 255, cv2.THRESH_BINARY
+        )
+        if _significant_enclosed_hole_count(area_resized) >= source_holes:
+            resized = area_resized
 
     # Create a 28x28 black canvas.
     canvas = np.zeros((canvas_size, canvas_size), dtype=np.uint8)

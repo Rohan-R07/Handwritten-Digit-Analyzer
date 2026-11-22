@@ -21,6 +21,10 @@ STRONG_TEMPLATE_THRESHOLD = 0.70
 # are allowed to break the tie. Otherwise template evidence dominates.
 TEMPLATE_TIE_MARGIN = 0.08
 
+# Used only when the lower-loop/upper-stem geometry is detected.
+SIX_STRUCTURE_WEIGHT = 0.65
+SIX_STRUCTURE_SCORE = 0.90
+
 
 def recognize_digit(cropped_binary, crop_info=None, min_hole_area=20):
     """
@@ -166,28 +170,60 @@ def recognize_digit(cropped_binary, crop_info=None, min_hole_area=20):
     cropped_binary_for_all = cropped_binary.copy()
     cropped_binary_for_normalized = cropped_binary.copy()
 
-    # Compute hole features directly using connected components (does not
-    # modify the input image, unlike findContours).
+    # Compute enclosed background regions directly using connected
+    # components. The digit strokes are white, so holes are components of
+    # the inverted image that do not touch its boundary.
     computed_min_hole_area = max(1, min_hole_area // 100)
     cropped_binary_for_all = cropped_binary.copy()
     cropped_binary_for_normalized = cropped_binary.copy()
 
-    # Compute hole features directly using connected components analysis
-    # (does not modify the input image).
-    num_labels, hole_labels, hole_stats, hole_centroids = cv2.connectedComponentsWithStats(
-        cropped_binary.copy(), connectivity=8
+    _, _, digit_width, digit_height = cv2.boundingRect(
+        cv2.findNonZero(cropped_binary)
     )
+    digit_bbox_area = float(digit_width * digit_height)
     hole_positions = []
     hole_areas = []
+    hole_bounds = []
     hole_count = 0
-    for i in range(1, num_labels):
-        area = float(hole_stats[i, cv2.CC_STAT_AREA])
-        if area >= computed_min_hole_area:
-            cx = float(hole_centroids[i][0]) / cropped_binary.shape[1]
-            cy = float(hole_centroids[i][1]) / cropped_binary.shape[1]
-            hole_positions.append((cx, cy))
-            hole_areas.append(float(area))
-            hole_count += 1
+    # A small closing is used only for topology analysis. It repairs tiny
+    # raster gaps without changing the image sent to templates or features.
+    for kernel_size in (1, 3, 5, 7):
+        topology_image = cropped_binary
+        if kernel_size > 1:
+            topology_image = cv2.morphologyEx(
+                cropped_binary,
+                cv2.MORPH_CLOSE,
+                np.ones((kernel_size, kernel_size), dtype=np.uint8),
+            )
+        num_labels, hole_labels, hole_stats, hole_centroids = cv2.connectedComponentsWithStats(
+            cv2.bitwise_not(topology_image), connectivity=8
+        )
+        candidate_holes = []
+        for i in range(1, num_labels):
+            left = int(hole_stats[i, cv2.CC_STAT_LEFT])
+            top = int(hole_stats[i, cv2.CC_STAT_TOP])
+            width = int(hole_stats[i, cv2.CC_STAT_WIDTH])
+            height = int(hole_stats[i, cv2.CC_STAT_HEIGHT])
+            # The exterior background reaches an image edge; only enclosed
+            # regions with meaningful area count as holes.
+            if left == 0 or top == 0 or left + width >= cropped_binary.shape[1] or top + height >= cropped_binary.shape[0]:
+                continue
+            area = float(hole_stats[i, cv2.CC_STAT_AREA])
+            if area >= max(computed_min_hole_area, digit_bbox_area * 0.08):
+                candidate_holes.append((
+                    float(hole_centroids[i][0]) / cropped_binary.shape[1],
+                    float(hole_centroids[i][1]) / cropped_binary.shape[0],
+                    area / digit_bbox_area,
+                    (left, top, width, height),
+                ))
+        if candidate_holes:
+            hole_positions = [(hole[0], hole[1]) for hole in candidate_holes]
+            hole_areas = [hole[2] for hole in candidate_holes]
+            hole_bounds = [hole[3] for hole in candidate_holes]
+            hole_count = len(candidate_holes)
+            break
+
+    lower_loop_with_stem = _has_lower_loop_with_upper_stem(cropped_binary)
 
     try:
         all_features = extract_all_features(
@@ -324,7 +360,7 @@ def recognize_digit(cropped_binary, crop_info=None, min_hole_area=20):
             if len(hole_positions) == 1:
                 hx, hy = hole_positions[0]
                 ha = hole_areas[0] if hole_areas else 0.0
-                if abs(hx - 0.5) < 0.2 and abs(hy - 0.5) < 0.2:
+                if abs(hx - 0.5) < 0.12 and abs(hy - 0.5) < 0.12:
                     # Hole must be large enough to be genuine (not just a gap
                     # between strokes).
                     if ha > 0.15:
@@ -342,9 +378,17 @@ def recognize_digit(cropped_binary, crop_info=None, min_hole_area=20):
                 ha = hole_areas[0] if hole_areas else 0.0
                 # Hole must be in lower half AND large enough to be genuine
                 # (not just a gap between strokes).
-                if hy > 0.55 and ha > 0.15:
+                hole_top = hole_bounds[0][1] if hole_bounds else cropped_binary.shape[0]
+                upper_stem_ratio = (
+                    (hole_top - cv2.boundingRect(cv2.findNonZero(cropped_binary))[1])
+                    / float(digit_height)
+                )
+                if hy > 0.50 and ha > 0.08 and upper_stem_ratio > 0.12:
                     strong_structural[6] = True
-                    structural_reasons[6] = "single enclosed hole at bottom"
+                    structural_reasons[6] = "single lower loop with an upper stem"
+        if lower_loop_with_stem:
+            strong_structural[6] = True
+            structural_reasons[6] = "lower U-shaped loop with an upper stem"
 
         # --- Digit 9: single hole at top ---
         strong_structural[9] = False
@@ -413,6 +457,15 @@ def recognize_digit(cropped_binary, crop_info=None, min_hole_area=20):
                     anti_digit1_penalty += 0.20
                 combined = max(0.0, combined - anti_digit1_penalty)
 
+            # A lower U-shaped cavity with a long upper stroke is direct
+            # structural evidence for 6 even when downsampling leaves the
+            # cavity open and the hole-based feature classifier misses it.
+            if digit == 6 and lower_loop_with_stem and template_score > 0.30:
+                combined = (
+                    (1.0 - SIX_STRUCTURE_WEIGHT) * combined
+                    + SIX_STRUCTURE_WEIGHT * SIX_STRUCTURE_SCORE
+                )
+
             # --- Shape-based boost for digits 2 and 3 ---
             # Shape similarity (cv2.matchShapes + distance transform) is more
             # robust to stroke style variations than pixel matching. When shape
@@ -426,8 +479,12 @@ def recognize_digit(cropped_binary, crop_info=None, min_hole_area=20):
                 shape_boost = 0.10 * shape_score
             elif digit == 0 and strong_structural.get(0, False) and shape_score > 0.45:
                 shape_boost = 0.10 * shape_score
+            elif digit == 6 and strong_structural.get(6, False) and shape_score > 0.45:
+                shape_boost = 0.10 * shape_score
 
             combined = combined + shape_boost
+            if digit == 6:
+                combined = min(combined, 1.0)
 
             combined_scores[digit] = combined
 
@@ -492,13 +549,22 @@ def recognize_digit(cropped_binary, crop_info=None, min_hole_area=20):
             feature_top = classification["ranked_candidates"][0]
             if feature_top[0] == int(top_digit):
                 result["explanation"] += " Geometric features agree."
+            elif int(top_digit) == 6 and lower_loop_with_stem:
+                result["explanation"] += (
+                    " Geometric feature scores lean toward digit {}, but the "
+                    "lower loop and upper stem support digit 6."
+                ).format(feature_top[0])
             else:
                 result["explanation"] += " Geometric features suggest digit {} instead.".format(
                     feature_top[0]
                 )
 
         # Add structural evidence note when it influenced the decision.
-        if strong_structural.get(int(top_digit), False) and result["status"] in ("ok", "uncertain"):
+        if (
+            strong_structural.get(int(top_digit), False)
+            and result["status"] in ("ok", "uncertain")
+            and not (int(top_digit) == 6 and lower_loop_with_stem)
+        ):
             result["explanation"] += (
                 " Structural evidence for digit {}: {}.".format(
                     top_digit, structural_reasons.get(int(top_digit), "")
@@ -506,6 +572,35 @@ def recognize_digit(cropped_binary, crop_info=None, min_hole_area=20):
             )
 
     return result
+
+
+def _has_lower_loop_with_upper_stem(binary_image):
+    """Detect a lower U-shaped loop preceded by a long upper stroke."""
+    points = cv2.findNonZero(binary_image)
+    if points is None:
+        return False
+
+    x, y, width, height = cv2.boundingRect(points)
+    gap_rows = []
+    minimum_gap = max(2, int(round(width * 0.18)))
+    midpoint = width / 2.0
+
+    for row_index in range(y, y + height):
+        foreground_x = np.flatnonzero(binary_image[row_index, x:x + width] > 0)
+        left_side = foreground_x[foreground_x < midpoint]
+        right_side = foreground_x[foreground_x >= midpoint]
+        if len(left_side) == 0 or len(right_side) == 0:
+            continue
+        gap = int(right_side.min()) - int(left_side.max()) - 1
+        if gap >= minimum_gap:
+            gap_rows.append(row_index - y)
+
+    if not gap_rows:
+        return False
+
+    loop_start_ratio = gap_rows[0] / float(height)
+    sustained_loop = len(gap_rows) >= max(4, int(np.ceil(height * 0.20)))
+    return loop_start_ratio >= 0.38 and sustained_loop
 
 
 def _projection_top_heavy_ratio(projection):
